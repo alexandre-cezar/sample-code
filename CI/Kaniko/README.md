@@ -1,0 +1,1 @@
+This directory contains a document that explains how to scan images built with Kaniko in CI

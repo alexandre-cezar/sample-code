@@ -1,0 +1,127 @@
+-----
+Overview
+This document provides some alternative scenarios for customers trying to scan images in their CI when kaniko is the image builder
+
+-----
+What is Kaniko?
+
+Kaniko is a tool designed to build container images from a Dockerfile, inside a container or Kubernetes cluster.
+Kaniko doesn't depend on a Docker daemon and executes each command within a Dockerfile completely in userspace. This enables building container images in environments that can't easily or securely run a Docker daemon, such as a standard Kubernetes cluster.
+
+-----
+Why is integration with Kaniko not trivial?
+
+Kaniko implements a "container in container" type of image building, which effectively hides the building image from the container runtime interface. Also, once the image is built, Kaniko automatically pushes it to a remote registry, therefore the building image never resides in the local host, preventing it from being scanned by any external solution.
+
+To support this kind of non-standard environment, Prisma Cloud Compute implements a feature called  "containerized scan", which allows us to scan the image by running the scan from inside a running container. This is typically done by running a container with a mounted volume with a tool called twistcli (provided by Prisma Cloud) that is designed to be a lightweight scanner.
+With this approach we can effectively scan containers even in environments where access to the container runtime engine is restricted, but as Kaniko doesn't expose the image to the underlying host, the alternative of starting a container with a mounted volume is not possible.
+
+To solve this problem, two alternatives are explored in this document:
+
+-----
+ALTERNATIVE A: Using twistcli inside the Dockerfile
+
+As mounting a volume inside the target container isn't an alternative (we can only mount a volume inside kaniko and this only allows us to scan kaniko itself), the only option left is to include twistcli as a file in the target image Dockerfile alongside with the proper command for it to scan the image.
+
+In this case, when the image is built, twistcli is invoked as part of the image build task and the image is scanned directly and policies are enforced at this moment.
+
+Scan results are presented at both the cli and the Compute console.
+
+Here, an initial image build is attempted with the Dockerfile containing twistcli and kaniko is set to use the --no-push option (which prevents the image from being pushed to the registry). 
+
+If this build fails due to scanning thresholds being violated, the DevOps team will work to fix them. If the scan succeeds, then another job is initiated that will build the same image, but now without twistcli and this time the image will be pushed to the registry.
+
+Pros:
+	Non-disruptive approach (no need to add external components)
+	Extremely fast scan times
+	Leverages existing capabilities in the Prisma Cloud Compute
+
+Cons:
+	It relies on the Dockerfiles to be properly written (tends to be a manual process)
+	It builds each image twice - (Caching could minimize this) - https://github.com/GoogleContainerTools/kaniko#caching
+	Containerized scans do not provide the image layer view for vulnerabilities. Prisma Compute will be able to tell what packages/binaries are vulnerable but not the layers where they were introduced. Layers can be found in subsequent image scans in the registry and deploy stages.
+
+-----
+Example of a Dockerfile that includes twistcli:
+FROM ubuntu:18.04
+RUN apt-get update && \
+  apt-get install -y redis-server && \
+  apt-get clean
+
+#Add Twistcli
+RUN mkdir /app
+COPY /twistcli /app/twistcli
+
+#Allow Twistcli to run
+RUN chmod a+x /app/twistcli
+
+EXPOSE 6379
+ENTRYPOINT ["redis-server", "--protected-mode no"]
+
+#Execute image scan
+RUN /app/twistcli images scan --containerized --details --address https://"console address" --user "user" --password : "password" "image name"
+-----
+
+Note: (twistcli images scan command must be added as the last step in the Dockerfile, otherwise we may miss packages added afterwards)
+
+-----
+ALTERNATIVE B:Using a separated infrastructure for scanning images
+
+In this solution, the pipeline is modified to have the image pushed to a dev registry integrated with Prisma Cloud Compute. A webhook message is sent to Prisma Cloud announcing that a new image is available and then, a Defender is invoked to scan the image immediately.
+
+It's important to note that the pipeline needs to wait for the image to be pulled from the registry, scanned and the results to be published (should be fairly quick). A job will pull the scan result from the "api/v1/registry?name="registry/repo/image_name" API endpoint and parse the response to verify if a severity threshold was violated (see a response example below). 
+If the threshold is met, then the DevOps team will fix the image and rerun the pipeline. If not, the pipeline will move forward and push the image to the production registry.
+If a webhook is not an alternative, you can add a job in the pipeline to start a registry scan after the image push using the /api/v1/registry/scan endpoint,
+
+Scan results are presented at both the cli and the Compute console.
+
+Pros
+	It doesn't modify the way that Kaniko operates
+	Doesn't change the Dockerfiles
+	It provides a layer based view of vulnerabilities in CI.
+
+Cons
+	It requires an additional infrastructure in order to work
+	It requires changes to the existing pipeline
+	It requires additional scripting in the existing pipeline to retrieve the results from the console
+	It can take longer for the pipeline to finish, due to additional registry pull/push events
+-----
+
+Reference: API response example for an image registry scan report (API response is shortened to display the relevant responses)
+
+-----
+API response
+[
+   {
+       "_id": "registry/repo/tag",
+       "type": "image",
+       "hostname": "hostname",
+       "scanTime": "2021-05-05T14:13:02.547Z",
+       "osDistro": "distro",
+       "osDistroVersion": "",
+       "osDistroRelease": "release",
+       "distro": "distro",
+       "image": {
+           "created": "2021-04-28T14:46:53.978Z"
+       },
+       "id": "sha256:",
+       "complianceIssues": null,
+       "allCompliance": {
+           "...": [
+       },
+       "vulnerabilities": null,
+       "...": {
+           "registry": "registry",
+           "repo": "repo",
+           "tag": "tag"
+       },
+       "creationTime": "2021-04-28T14:46:53.978Z",
+       "vulnerabilitiesCount": 35,
+       "complianceIssuesCount": 0,
+       "vulnerabilityDistribution": {
+           "critical": 4,
+           "high": 10,
+           "medium": 18,
+           "low": 3,
+           "total": 35
+}
